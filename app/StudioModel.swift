@@ -177,7 +177,12 @@ final class StudioModel: ObservableObject {
       return p
     }
     presets = [
-      SavedPreset(id: "neon", name: "Neon Current", values: values([:])),
+      SavedPreset(
+        id: "neon", name: "Motion Lightning",
+        values: values([
+          "tracking": 0.9, "lifetime": 1.0, "glow": 0.18, "trailHalfLife": 0.035,
+          "colorMode": 1, "palette": ["0ACDFF", "FF1475", "FFDD18"],
+        ])),
       SavedPreset(
         id: "organic", name: "Soft Organics",
         values: values([
@@ -745,6 +750,8 @@ final class StudioModel: ObservableObject {
       "lineWidth": 0.5...18, "distortion": 0...1, "density": 0...1, "threshold": 0.01...0.5,
       "glow": 0...2, "trailHalfLife": 0...1, "hueOffset": 0...1, "hueSpeed": 0...0.5,
       "lifetime": 0.05...3, "updateHz": 0.1...30,
+      "strokeLength": 60...900, "jaggedSpacing": 8...180, "motionResponse": 0...1,
+      "irregularity": 0...1,
     ]
     if target == "enabled" {
       set(target, value > 0.5, origin: "midi:\(key):\(Int(value*127))")

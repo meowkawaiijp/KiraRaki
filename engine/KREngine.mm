@@ -434,6 +434,9 @@
     p.tracking = [preset[@"tracking"] floatValue];
     p.updateHz = [preset[@"updateHz"] floatValue];
     p.irregularity = [preset[@"irregularity"] floatValue];
+    p.strokeLength = [preset[@"strokeLength"] floatValue];
+    p.jaggedSpacing = [preset[@"jaggedSpacing"] floatValue];
+    p.motionResponse = [preset[@"motionResponse"] floatValue];
     p.seed = [preset[@"seed"] unsignedLongLongValue];
     p.hueSpeed = [preset[@"hueSpeed"] floatValue];
     p.hueOffset = [preset[@"hueOffset"] floatValue];

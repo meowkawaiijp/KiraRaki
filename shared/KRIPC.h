@@ -4,6 +4,7 @@
 
 NS_ASSUME_NONNULL_BEGIN
 FOUNDATION_EXPORT NSString *const KRServiceName;
+FOUNDATION_EXPORT NSString *const KRAlgorithmVersion;
 FOUNDATION_EXPORT NSDictionary *KRDefaultPreset(void);
 FOUNDATION_EXPORT NSDictionary *_Nullable KRValidatePreset(NSDictionary *value, NSError **error);
 FOUNDATION_EXPORT NSDictionary *KRInterpolatePreset(NSDictionary *from, NSDictionary *to,

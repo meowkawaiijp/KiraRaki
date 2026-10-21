@@ -94,7 +94,7 @@
 - (void)hello:(NSDictionary *)identity reply:(void (^)(NSDictionary *))reply {
     reply(@{
         @"protocol" : @1,
-        @"engineVersion" : @"0.1.0",
+        @"engineVersion" : KRAlgorithmVersion,
         @"transport" : @"XPC / IOSurface",
         @"renderer" : @"Metal"
     });
@@ -524,7 +524,7 @@
         }
         NSMutableDictionary *manifest = [@{
             @"schemaVersion" : @1,
-            @"algorithmVersion" : @"0.1.0",
+            @"algorithmVersion" : KRAlgorithmVersion,
             @"preset" : _sessions[source].effectivePreset ?: _preset,
             @"sourceID" : source,
             @"inputPath" : cleanFeed ? @"clean.mov" : inputPath,

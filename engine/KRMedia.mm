@@ -278,7 +278,7 @@ BOOL KRExportMovie(NSURL *input, NSURL *output, NSString *shader, NSDictionary *
             if (![manifest isKindOfClass:NSDictionary.class] ||
                 [manifest[@"schemaVersion"] intValue] != 1)
                 return fail(@"再現マニフェストの形式が不正です");
-            if (![manifest[@"algorithmVersion"] isEqual:@"0.1.0"])
+            if (![manifest[@"algorithmVersion"] isEqual:KRAlgorithmVersion])
                 return fail(@"異なるアルゴリズムバージョンの録画です");
             if (![manifest[@"complete"] boolValue])
                 return fail(@"録画が完了していないか、入力映像の欠落が記録されています");

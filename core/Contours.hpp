@@ -18,8 +18,9 @@ struct Vertex {
 };
 struct Parameters {
     float width = 3, distortion = .45f, density = .35f, threshold = .14f;
-    float lifetime = 0.65f, tracking = .8f, updateHz = 12, irregularity = .5f;
-    std::array<float, 4> shapes{1, .7f, .25f, .45f};
+    float lifetime = 0.65f, tracking = .8f, updateHz = 4, irregularity = .9f;
+    float strokeLength = 420, jaggedSpacing = 48, motionResponse = 1;
+    std::array<float, 4> shapes{1, 0, 0, 0};
     std::array<float, 5> regions{.3f, .3f, .12f, .2f, .08f};
     std::array<float, 3> placement{.2f, .5f, .3f};
     float hueSpeed = .08f, hueOffset = 0, opacity = 1;
@@ -33,6 +34,8 @@ struct Stroke {
     double birth, lastSeen;
     float confidence = 1;
     Point center;
+    std::vector<float> motion;
+    float salience = .5f;
 };
 struct Statistics {
     int candidates = 0, strokes = 0, vertices = 0;
@@ -48,6 +51,7 @@ class Contours {
     std::vector<Stroke> tracks;
     uint64_t nextID = 1;
     double lastPTS = -1;
+    float lastCandidateLength = 0;
     int lastW = 0, lastH = 0;
 };
 uint64_t hash(uint64_t);

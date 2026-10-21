@@ -7,6 +7,7 @@
 #include <memory>
 
 NSString *const KRServiceName = @"jp.meowkawaii.KiraRaki.render";
+NSString *const KRAlgorithmVersion = @"0.2.0";
 uint64_t KRClockNS(void) {
     static mach_timebase_info_data_t t = [] {
         mach_timebase_info_data_t a;
@@ -27,9 +28,12 @@ NSDictionary *KRDefaultPreset(void) {
         @"threshold" : @.14,
         @"lifetime" : @.65,
         @"tracking" : @.8,
-        @"updateHz" : @12,
-        @"irregularity" : @.5,
-        @"shapes" : @[ @1, @.7, @.25, @.45 ],
+        @"updateHz" : @4,
+        @"irregularity" : @.9,
+        @"strokeLength" : @420,
+        @"jaggedSpacing" : @48,
+        @"motionResponse" : @1,
+        @"shapes" : @[ @1, @0, @0, @0 ],
         @"regions" : @[ @.3, @.3, @.12, @.2, @.08 ],
         @"placement" : @[ @.2, @.5, @.3 ],
         @"colorMode" : @0,
@@ -68,6 +72,9 @@ NSDictionary *KRValidatePreset(NSDictionary *value, NSError **error) {
         @"tracking" : @[ @0, @1 ],
         @"updateHz" : @[ @.1, @60 ],
         @"irregularity" : @[ @0, @1 ],
+        @"strokeLength" : @[ @60, @900 ],
+        @"jaggedSpacing" : @[ @8, @180 ],
+        @"motionResponse" : @[ @0, @1 ],
         @"hueSpeed" : @[ @-2, @2 ],
         @"hueOffset" : @[ @0, @1 ],
         @"glow" : @[ @0, @3 ],
@@ -168,7 +175,7 @@ NSDictionary *KRInterpolatePreset(NSDictionary *from, NSDictionary *to, double p
     for (NSString *k in @[
              @"lineWidth", @"distortion", @"density", @"threshold", @"lifetime", @"tracking",
              @"updateHz", @"irregularity", @"hueSpeed", @"hueOffset", @"glow", @"glowRadius",
-             @"trailHalfLife"
+             @"trailHalfLife", @"strokeLength", @"jaggedSpacing", @"motionResponse"
          ]) {
         double x = [from[k] doubleValue], y = [to[k] doubleValue];
         p[k] = @(x + (y - x) * a);

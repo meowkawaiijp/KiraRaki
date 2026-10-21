@@ -360,11 +360,19 @@ struct StudioView: View {
         }
       }
       VStack(alignment: .leading, spacing: 14) {
+        eyebrow("CONTOUR / 線のつながりと強弱")
+        knob("線の長さ", key: "strokeLength", range: 60...900, format: "%.0f px")
+        knob("ギザギザの間隔", key: "jaggedSpacing", range: 8...180, format: "%.0f px")
+        knob("動きへの反応", key: "motionResponse", range: 0...1, format: "%.0f%%", multiplier: 100)
+        knob("線内の強弱", key: "irregularity", range: 0...1, format: "%.0f%%", multiplier: 100)
+        Text("間隔を広げると、長い直線でつなぐ粗いギザギザになります。動く部分ほど強く変形し、一本の線にも大小を混ぜます。長さと間隔は1080p基準です。")
+          .font(.caption2).foregroundStyle(.secondary)
+      }
+      VStack(alignment: .leading, spacing: 14) {
         eyebrow("TIME / 追従と持続")
         knob("追従度", key: "tracking", range: 0...1, format: "%.0f%%", multiplier: 100)
-        knob("揺らぎ", key: "irregularity", range: 0...1, format: "%.0f%%", multiplier: 100)
         knob("寿命", key: "lifetime", range: 0.05...4, format: "%.2f s")
-        knob("変化・更新頻度", key: "updateHz", range: 0.1...30, format: "%.1f Hz")
+        knob("揺らぐ速さ", key: "updateHz", range: 0.1...30, format: "%.1f Hz")
         Picker("検出途切れ", selection: intBinding("lossMode")) {
           Text("保持 → 減衰").tag(0)
           Text("すぐに消去").tag(1)
@@ -543,6 +551,7 @@ private struct AudioMIDIView: View {
   private let targets = [
     "lineWidth", "distortion", "density", "glow", "trailHalfLife", "hueOffset", "hueSpeed",
     "lifetime", "updateHz",
+    "strokeLength", "jaggedSpacing", "motionResponse", "irregularity",
   ]
   var body: some View {
     Group {
