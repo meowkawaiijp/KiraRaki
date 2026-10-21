@@ -1,0 +1,8 @@
+build/
+.build/
+.deps/
+.DS_Store
+*.xcuserstate
+*.mov
+*.mp4
+*.kirareplay/

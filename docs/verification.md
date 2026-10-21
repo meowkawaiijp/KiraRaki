@@ -1,0 +1,50 @@
+# 短い動作確認の記録
+
+実施日: 2026-10-21。実装を優先し、長時間試験や網羅的なテストスイートは実施していない。
+
+環境: MacBook Air M3、16GB、macOS 26.4.1、Xcode 26.4.1、OBS Studio 32.2.2、arm64 Releaseビルド。
+
+## 確認したこと
+
+| 対象 | 結果 |
+| --- | --- |
+| ネイティブビルド | C++、Objective-C++、SwiftUI、サービス、CLI、OBSプラグインがビルド成功 |
+| Macアプリ | 保存済みの調整値を引き継いで起動し、元映像に線を合成した実際のプレビューを確認 |
+| XPC / IOSurface | 実際に別プロセスへ入力を送り、Metalで生成したフレームを受信 |
+| 合成・黒・透明 | 灰色の入力画素が合成では保持され、黒背景は不透明、RGBAの背景はアルファ0になることを確認 |
+| リアルタイム録画 | 640×360 / 12フレームの音声付きMP4、加工前ProRes 422 HQ、完了マニフェスト、入力SHA-256を保存 |
+| ProRes 4444 | 保存セッションから0.4秒を書き出し、再デコードしてアルファあり・背景アルファ0を確認 |
+| HEVC with Alpha | 合成イベントログを適用して0.4秒を書き出し、再デコードしてアルファあり・背景アルファ0を確認 |
+| 1080pの動画保存 | 1920×1080 / 12フレーム、音声トラック1本を持つMP4を生成・デコード |
+| OBS / Metal | 実際のlibobsでプラグインを読み込み、フィルタの出力13フレームから色付きの線を検出 |
+| OBS / OpenGL | 独立ソースをフィルタ付き入力へ接続し、出力14フレームから色付きの線を検出 |
+
+OBS確認にはインストール済みOBSのlibobsを使い、ユーザーのシーンコレクションを変更しない短い実行プログラムを使用した。テスト用入力はグレーの図形で、加工後の色を合成出力から確認した。
+
+HEVCのログ確認では、MIDI由来の線幅変更を表す合成イベントと、補間時間を持つプリセット変更を使用した。物理MIDI機器の試験を意味しない。
+
+1080pの確認は画像処理モードの短い図形デモで、OBS往復・AI負荷・熱・長時間稼働を含む性能保証ではない。
+
+## 再実行する場合
+
+通常の開発で毎回行う必要はない。映像出力やOBS境界を変更したときに、該当するものだけを短く確認する。
+
+```sh
+scripts/build.sh --obs
+scripts/service.sh start
+cli=build/KiraRaki.app/Contents/MacOS/KiraRakiCLI
+"$cli" service-smoke
+"$cli" record-demo --frames 12 --output build/check.mp4 --tone
+"$cli" export --input build/check.kirareplay/clean.mov --output build/check-alpha.mov \
+  --codec prores4444 --mode 2 --events build/check.kirareplay/events.jsonl --mute
+```
+
+OBSの境界確認が必要な場合のみ、`cmake --build build/native --target KiraRakiOBSCheck`で確認用プログラムをビルドする。引数はプラグインの実行ファイル、`metal`または`opengl`、独立ソースを試す場合は`source`。同じ保存先の動画が既にある場合は別名を指定する。
+
+## 未実施の受入項目
+
+- カメラの実機入力、物理MIDIコントローラー、実際の音楽・複雑なOBSシーンを用いる調整。
+- 入力からOBSの合成出力までの外部基準によるp95遅延、実際のA/V同期測定。
+- 30分の出力欠落率、2時間の連続運転、リーク・熱条件の評価。
+- OBS 33 RCとの互換性、透過動画を各編集／再生アプリに読み込む評価。
+- 写真・実写での美的品質の調整、OSやVisionのバージョン差をまたぐ再現性。
