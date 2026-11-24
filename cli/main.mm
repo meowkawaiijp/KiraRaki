@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cmath>
 #include <thread>
+#include <algorithm>
+#include <vector>
 
 static IOSurface *demo(int frame, int w, int h) {
     IOSurface *s = KRMakeSurface(w, h);
@@ -212,13 +214,23 @@ int main(int argc, const char *argv[]) {
                 frames = args[@"frames"] ? [args[@"frames"] intValue] : 30;
             NSMutableDictionary *p = [preset mutableCopy];
             p[@"analysisMode"] = @1;
+            if (args[@"cpu-contours"])
+                e.gpuClassificationEnabled = NO;
+            if (args[@"single-output"])
+                e.singleOutput = YES;
+            if (args[@"fixed-quality"])
+                p[@"autoAdapt"] = @NO;
+            int warmup = args[@"warmup"] ? [args[@"warmup"] intValue] : 0;
+            if (warmup < 0 || warmup > 10000 || (warmup && args[@"output"]))
+                return 2;
             if (w <= 0 || h <= 0 || w > 7680 || h > 4320 || frames <= 0)
                 return 2;
             if (args[@"mode"])
                 p[@"outputMode"] = @([args[@"mode"] intValue]);
             KRMovieWriter *writer = nil;
-            double ms = 0;
-            for (int f = 0; f < frames; f++) {
+            double ms = 0, analysis = 0, contours = 0, draw = 0;
+            std::vector<double> durations;
+            for (int f = 0; f < frames + warmup; f++) {
                 @autoreleasepool {
                     if (args[@"tone"])
                         [e audio:tone(f)];
@@ -233,7 +245,14 @@ int main(int argc, const char *argv[]) {
                         fprintf(stderr, "Render failed: %s\n", err.localizedDescription.UTF8String);
                         return 1;
                     }
-                    ms += [e.statistics[@"processingMS"] doubleValue];
+                    if (f < warmup)
+                        continue;
+                    double frameMS = [e.statistics[@"processingMS"] doubleValue];
+                    ms += frameMS;
+                    durations.push_back(frameMS);
+                    analysis += [e.statistics[@"analysisMS"] doubleValue];
+                    contours += [e.statistics[@"contourMS"] doubleValue];
+                    draw += [e.statistics[@"drawMS"] doubleValue];
                     if (args[@"output"]) {
                         if (!writer)
                             writer = [[KRMovieWriter alloc]
@@ -261,9 +280,15 @@ int main(int argc, const char *argv[]) {
                 fprintf(stderr, "%s\n", err.localizedDescription.UTF8String);
                 return 1;
             }
+            std::sort(durations.begin(), durations.end());
             json(@{
                 @"frames" : @(frames),
+                @"warmupFrames" : @(warmup),
                 @"meanProcessingMS" : @(ms / frames),
+                @"p95ProcessingMS" : @(durations[(size_t(frames) * 95 + 99) / 100 - 1]),
+                @"meanAnalysisMS" : @(analysis / frames),
+                @"meanContourMS" : @(contours / frames),
+                @"meanDrawMS" : @(draw / frames),
                 @"lastFrame" : e.statistics
             });
             return 0;

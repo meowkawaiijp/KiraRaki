@@ -323,8 +323,10 @@ NSXPCInterface *KRServiceInterface(void) {
     _previewPending = NO;
     _latest = nil;
     _metadata = @{};
-    for (int i = 0; i < 3; ++i)
+    for (int i = 0; i < 3; ++i) {
         _busy[i] = false;
+        _slots[i] = nil; // never reuse a surface after a connection interruption
+    }
 }
 - (id<KRRenderService>)proxy {
     [self connect];
@@ -363,9 +365,14 @@ NSXPCInterface *KRServiceInterface(void) {
                       pts:(uint64_t)pts
                    source:(NSString *)source
                      mode:(NSInteger)mode {
-    if (CVPixelBufferGetPixelFormatType(b) != kCVPixelFormatType_32BGRA)
+    if (!b || CVPixelBufferGetPixelFormatType(b) != kCVPixelFormatType_32BGRA)
         return NO;
-    CVPixelBufferLockBaseAddress(b, kCVPixelBufferLock_ReadOnly);
+    if (CVPixelBufferGetIOSurface(b))
+        return [self submitFrame:nullptr direct:b width:CVPixelBufferGetWidth(b)
+                          height:CVPixelBufferGetHeight(b) rowBytes:CVPixelBufferGetBytesPerRow(b)
+                             pts:pts source:source mode:mode];
+    if (CVPixelBufferLockBaseAddress(b, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess)
+        return NO;
     BOOL ok = [self submitBGRA:CVPixelBufferGetBaseAddress(b)
                          width:CVPixelBufferGetWidth(b)
                         height:CVPixelBufferGetHeight(b)
@@ -383,7 +390,17 @@ NSXPCInterface *KRServiceInterface(void) {
                pts:(uint64_t)pts
             source:(NSString *)source
               mode:(NSInteger)mode {
-    if (!bytes || stride < w * 4)
+    return [self submitFrame:bytes direct:nullptr width:w height:h rowBytes:stride
+                         pts:pts source:source mode:mode];
+}
+- (BOOL)submitFrame:(const void *)bytes direct:(CVPixelBufferRef)pixel
+              width:(NSUInteger)w height:(NSUInteger)h rowBytes:(NSUInteger)stride
+                pts:(uint64_t)pts source:(NSString *)source mode:(NSInteger)mode {
+    if ((!bytes && !pixel) || !w || !h || w > 7680 || h > 4320 || stride < w * 4)
+        return NO;
+    const uint64_t ingest = KRClockNS();
+    IOSurfaceRef directSurface = pixel ? CVPixelBufferGetIOSurface(pixel) : nullptr;
+    if (pixel && !directSurface)
         return NO;
     id<KRRenderService> proxy = [self proxy];
     if (!self.connected || !proxy)
@@ -400,9 +417,13 @@ NSXPCInterface *KRServiceInterface(void) {
             }
         if (slot < 0)
             return NO;
-        if (_slots[slot].width != w || _slots[slot].height != h)
-            _slots[slot] = KRMakeSurface(w, h);
-        surface = _slots[slot];
+        if (directSurface) {
+            surface = (__bridge IOSurface *)directSurface;
+        } else {
+            if (_slots[slot].width != w || _slots[slot].height != h)
+                _slots[slot] = KRMakeSurface(w, h);
+            surface = _slots[slot];
+        }
         if (!surface)
             return NO;
         _busy[slot] = true;
@@ -410,11 +431,25 @@ NSXPCInterface *KRServiceInterface(void) {
         _slotFrame[slot] = fid;
         generation = _generation;
     }
-    [surface lockWithOptions:0 seed:nullptr];
-    for (NSUInteger y = 0; y < h; ++y)
-        memcpy((uint8_t *)surface.baseAddress + y * surface.bytesPerRow,
-               (uint8_t *)bytes + y * stride, w * 4);
-    [surface unlockWithOptions:0 seed:nullptr];
+    std::shared_ptr<const void> lease;
+    if (directSurface) {
+        // Hold the pixel buffer and use count through the XPC reply, including
+        // pooled buffers. The server also holds a count while it reads the input.
+        IOSurfaceIncrementUseCount(directSurface);
+        lease = std::shared_ptr<const void>(CVPixelBufferRetain(pixel), [directSurface](const void *p) {
+            IOSurfaceDecrementUseCount(directSurface);
+            CVPixelBufferRelease((CVPixelBufferRef)p);
+        });
+    } else {
+        [surface lockWithOptions:0 seed:nullptr];
+        if (stride == surface.bytesPerRow && stride == w * 4)
+            memcpy(surface.baseAddress, bytes, stride * h);
+        else
+            for (NSUInteger y = 0; y < h; ++y)
+                memcpy((uint8_t *)surface.baseAddress + y * surface.bytesPerRow,
+                       (const uint8_t *)bytes + y * stride, w * 4);
+        [surface unlockWithOptions:0 seed:nullptr];
+    }
     __weak KRClient *weak = self;
     [proxy process:surface
           metadata:@{
@@ -422,7 +457,8 @@ NSXPCInterface *KRServiceInterface(void) {
               @"sourceID" : source,
               @"frameID" : @(fid),
               @"ptsNS" : @(pts),
-              @"ingestNS" : @(KRClockNS()),
+              @"ingestNS" : @(ingest),
+              @"inputCopyBytes" : @(directSurface ? 0 : w * h * 4),
               @"mode" : @(mode),
               @"colorPrimaries" : @"Rec.709",
               @"transfer" : @"Rec.709",
@@ -430,6 +466,7 @@ NSXPCInterface *KRServiceInterface(void) {
               @"alpha" : @"premultiplied"
           }
              reply:^(IOSurface *out, NSDictionary *meta) {
+                 (void)lease;
                  KRClient *s = weak;
                  if (!s)
                      return;

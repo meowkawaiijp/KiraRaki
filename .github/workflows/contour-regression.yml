@@ -3,6 +3,11 @@ on:
   pull_request:
     paths:
       - 'core/**'
+      - 'engine/**'
+      - 'app/**'
+      - 'shared/**'
+      - 'service/**'
+      - 'cli/**'
       - 'tests/**'
       - 'scripts/test-core.sh'
       - '.github/workflows/contour-regression.yml'
@@ -20,3 +25,19 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: bash scripts/test-core.sh "$BASE_SHA"
+  native-build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build native arm64 engine, service, CLI and app
+        run: DEVELOPER_DIR="$(xcode-select -p)" bash scripts/build.sh
+      - name: Compile Metal kernels when toolchain is available
+        run: |
+          if xcrun -sdk macosx -find metal >/dev/null 2>&1; then
+            xcrun -sdk macosx metal -c engine/Effects.metal -o "$RUNNER_TEMP/Effects.air"
+          else
+            echo "::warning::Metal compiler unavailable; hardware validation required"
+          fi

@@ -5,6 +5,7 @@
 #import <CoreImage/CoreImage.h>
 #import <Accelerate/Accelerate.h>
 #include "Contours.hpp"
+#include "Performance.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -18,12 +19,15 @@
     NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *_compute;
     id<MTLRenderPipelineState> _line;
     id<MTLTexture> _gray, _previous, _flow, _mask, _layer, _history[2], _small[3];
-    id<MTLBuffer> _features, _vertexBuffer;
+    id<MTLBuffer> _features, _vertexBuffer, _ridgeMask;
     CIContext *_ci;
     dispatch_queue_t _visionQueue;
     std::mutex _visionLock;
     CVPixelBufferRef _visionMask;
     std::atomic<bool> _visionBusy;
+    std::atomic<double> _visionMS;
+    uint64_t _maskRevision, _uploadedMaskRevision;
+    double _maskPTS;
     NSString *_visionError;
     BOOL _visionHasForeground;
     std::atomic<uint64_t> _generation;
@@ -31,8 +35,11 @@
     NSMutableDictionary<NSNumber *, IOSurface *> *_outputs;
     kira::Contours _contours;
     NSDictionary *_statistics;
-    int _aw, _ah, _w, _h, _historyIndex, _frame, _level, _healthy, _bloomDivisor;
-    double _lastPTS, _lastVision, _costEMA;
+    int _aw, _ah, _w, _h, _historyIndex, _bloomDivisor;
+    double _lastPTS, _lastVision;
+    kira::AdaptiveRender _adaptive;
+    kira::RollingSamples<> _renderTimes, _outputIntervals;
+    uint64_t _lastRenderNS;
     std::vector<float> _audioWindow;
     std::array<float, 2048> _hannWindow;
     std::vector<float> _prevSpectrum;
@@ -62,7 +69,8 @@
             return nil;
         _compute = [NSMutableDictionary dictionary];
         for (NSString *n in
-             @[ @"prepare", @"flow", @"features", @"downsample", @"blur", @"finish" ]) {
+             @[ @"prepare", @"flow", @"features", @"classifyRidges", @"downsample", @"blur",
+                @"finish", @"finishSingle" ]) {
             _compute[n] = [_device newComputePipelineStateWithFunction:[lib newFunctionWithName:n]
                                                                  error:error];
             if (!_compute[n])
@@ -85,6 +93,9 @@
         _statistics = @{};
         _outputs = [NSMutableDictionary dictionary];
         _lastPTS = -1;
+        _lastVision = -1e30;
+        _uploadedMaskRevision = UINT64_MAX;
+        _gpuClassificationEnabled = YES;
         _fft = vDSP_create_fftsetup(11, kFFTRadix2);
         _prevSpectrum.resize(1024);
         vDSP_hann_window(_hannWindow.data(), _hannWindow.size(), vDSP_HANN_NORM);
@@ -133,7 +144,12 @@
             CVPixelBufferRelease(_visionMask);
         _visionMask = nullptr;
         _visionHasForeground = NO;
+        ++_maskRevision;
     }
+    _uploadedMaskRevision = UINT64_MAX;
+    _lastRenderNS = 0;
+    _outputIntervals.clear();
+    _renderTimes.clear();
     _lastVision = -1e30;
     _contours.reset();
     _gray = nil;
@@ -203,20 +219,22 @@
     }
     return KRValidatePreset(p, nullptr) ?: preset;
 }
-- (void)updateVision:(IOSurface *)surface pts:(double)pts mode:(int)mode {
+- (void)updateVision:(IOSurface *)surface pts:(double)pts mode:(int)mode
+             profile:(kira::RenderProfile)profile interval:(double)interval
+             command:(id<MTLCommandBuffer>)command {
     if (mode == 1)
         return;
-    double interval = _offline ? 0 : (.1 * std::pow(1.6, _level));
     if (pts - _lastVision < interval || _visionBusy.exchange(true))
         return;
     _lastVision = pts;
     // Copy a small immutable input: capture/OBS may recycle its IOSurface once this frame replies.
-    int vw = _level >= 2 ? 384 : 512,
+    int vw = profile.visionWidth,
         vh = std::max(1, int(surface.height * double(vw) / surface.width));
     CVPixelBufferRef pixel = nullptr;
     CVReturn status = CVPixelBufferCreate(
         kCFAllocatorDefault, vw, vh, kCVPixelFormatType_32BGRA,
-        (__bridge CFDictionaryRef) @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}}, &pixel);
+        (__bridge CFDictionaryRef) @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+                                      (id)kCVPixelBufferMetalCompatibilityKey : @YES}, &pixel);
     if (status != kCVReturnSuccess || !pixel) {
         if (pixel)
             CVPixelBufferRelease(pixel);
@@ -231,11 +249,26 @@
     image =
         [image imageByApplyingTransform:CGAffineTransformMakeScale(double(vw) / surface.width,
                                                                    double(vh) / surface.height)];
-    [_ci render:image toCVPixelBuffer:pixel bounds:CGRectMake(0, 0, vw, vh) colorSpace:color];
-    CGColorSpaceRelease(color);
     uint64_t generation = _generation.load();
+    const BOOL offline = _offline;
+    id<MTLTexture> visionInput = nil;
+    if (!offline && command && CVPixelBufferGetIOSurface(pixel)) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+            width:vw height:vh mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+        visionInput = [_device newTextureWithDescriptor:d
+                                               iosurface:CVPixelBufferGetIOSurface(pixel) plane:0];
+    }
+    if (visionInput)
+        [_ci render:image toMTLTexture:visionInput commandBuffer:command
+             bounds:CGRectMake(0, 0, vw, vh) colorSpace:color];
+    else
+        [_ci render:image toCVPixelBuffer:pixel bounds:CGRectMake(0, 0, vw, vh) colorSpace:color];
+    CGColorSpaceRelease(color);
     void (^work)(void) = ^{
         @autoreleasepool {
+            const uint64_t visionStart = KRClockNS();
             NSError *err = nil;
             VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pixel
                                                                                     options:@{}];
@@ -252,7 +285,7 @@
             if (!result) {
                 VNGeneratePersonSegmentationRequest *person =
                     [VNGeneratePersonSegmentationRequest new];
-                person.qualityLevel = self->_offline
+                person.qualityLevel = offline
                                           ? VNGeneratePersonSegmentationRequestQualityLevelAccurate
                                           : VNGeneratePersonSegmentationRequestQualityLevelBalanced;
                 person.outputPixelFormat = kCVPixelFormatType_OneComponent8;
@@ -284,19 +317,33 @@
                     if (self->_visionMask)
                         CVPixelBufferRelease(self->_visionMask);
                     self->_visionMask = result;
+                    self->_maskPTS = pts;
+                    ++self->_maskRevision;
                     self->_visionHasForeground = foreground;
                     self->_visionError = err.localizedDescription;
                 } else if (result)
                     CVPixelBufferRelease(result);
             }
             CVPixelBufferRelease(pixel);
+            self->_visionMS.store((KRClockNS() - visionStart) * 1e-6);
             self->_visionBusy = false;
         }
     };
-    if (_offline)
+    if (offline) {
         work();
-    else
+    } else if (visionInput) {
+        // The GPU copies the immutable input before Vision can read it.
+        [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+            if (completed.status == MTLCommandBufferStatusCompleted)
+                dispatch_async(self->_visionQueue, work);
+            else {
+                CVPixelBufferRelease(pixel);
+                self->_visionBusy = false;
+            }
+        }];
+    } else {
         dispatch_async(_visionQueue, work);
+    }
 }
 - (IOSurface *)render:(IOSurface *)surface
              metadata:(NSDictionary *)metadata
@@ -315,34 +362,51 @@
             value *= std::exp2(-dt / .08f);
     NSDictionary *preset = [self modulated:base dt:dt];
     int analysis = [preset[@"analysisMode"] intValue];
-    [self updateVision:surface pts:pts mode:analysis];
-    int aw = std::min(w, _level >= 2 ? 384
-                         : _offline  ? 960
-                                     : 640),
-        ah = std::max(1, int(h * double(aw) / w));
-    int divisor = _level >= 5 ? 8 : (_offline ? 2 : 4);
-    BOOL fresh = !_gray || _aw != aw || _ah != ah || w != _w || h != _h || _bloomDivisor != divisor;
-    if (fresh) {
-        _bloomDivisor = divisor;
+    const bool adapt = !_offline && [preset[@"autoAdapt"] boolValue];
+    if (!adapt)
+        _adaptive.reset();
+    const int usedLevel = _adaptive.level();
+    const auto profile = _adaptive.profile(_offline);
+    const double visionInterval = _adaptive.visionInterval(_offline, adapt, _visionMS.load());
+    int aw = std::min(w, profile.width);
+    int ah = std::max(1, int(h * double(aw) / w));
+    int divisor = profile.bloomDivisor;
+    const BOOL freshOutput = !_history[0] || !_history[1] || !_layer || w != _w || h != _h;
+    const BOOL freshAnalysis = !_gray || !_previous || _aw != aw || _ah != ah || w != _w || h != _h;
+    const BOOL freshBloom = !_small[0] || !_small[1] || !_small[2] ||
+                            freshOutput || _bloomDivisor != divisor;
+    if (freshAnalysis) {
         _aw = aw;
         _ah = ah;
-        _w = w;
-        _h = h;
         _gray = [self texture:MTLPixelFormatR32Float w:aw h:ah];
         _previous = [self texture:MTLPixelFormatR32Float w:aw h:ah];
         _flow = [self texture:MTLPixelFormatRG32Float w:(aw + 7) / 8 h:(ah + 7) / 8];
         _mask = [self texture:MTLPixelFormatR8Unorm w:aw h:ah];
+        _features = [_device newBufferWithLength:size_t(aw) * ah * sizeof(kira::Feature)
+                                         options:MTLResourceStorageModeShared];
+        _ridgeMask = nil;
+        _uploadedMaskRevision = UINT64_MAX;
+        _contours.reset();
+    }
+    if (freshOutput) {
+        _w = w;
+        _h = h;
+        _historyIndex = 0;
         _layer = [self texture:MTLPixelFormatRGBA16Float w:w h:h];
         for (int i = 0; i < 2; ++i)
             _history[i] = [self texture:MTLPixelFormatRGBA16Float w:w h:h];
+    }
+    if (freshBloom) {
+        _bloomDivisor = divisor;
         for (int i = 0; i < 3; ++i)
             _small[i] = [self texture:MTLPixelFormatRGBA16Float
-                                    w:std::max(1, w / _bloomDivisor)
-                                    h:std::max(1, h / _bloomDivisor)];
-        _features = [_device newBufferWithLength:aw * ah * sizeof(kira::Feature)
-                                         options:MTLResourceStorageModeShared];
-        _contours.reset();
+                                    w:std::max(1, w / divisor) h:std::max(1, h / divisor)];
     }
+    // Optional mask: allocation failure falls back to the existing CPU path.
+    const bool wantGPUClassify = !_offline && _gpuClassificationEnabled && size_t(aw) * ah >= 65536;
+    if (wantGPUClassify && !_ridgeMask)
+        _ridgeMask = [_device newBufferWithLength:size_t(aw) * ah options:MTLResourceStorageModeShared];
+    const bool gpuClassify = wantGPUClassify && _ridgeMask != nil;
     if (!_gray || !_previous || !_flow || !_mask || !_layer || !_history[0] ||
         !_history[1] || !_small[0] || !_small[1] || !_small[2] || !_features) {
         [self reset];
@@ -363,9 +427,15 @@
     if (!input)
         return nil;
     id<MTLCommandBuffer> c = [_queue commandBuffer];
+    if (!c)
+        return nil;
+    [self updateVision:surface pts:pts mode:analysis profile:profile
+               interval:visionInterval command:c];
     CVPixelBufferRef mask = nullptr;
     NSString *visionError;
     BOOL foreground = NO;
+    uint64_t maskRevision;
+    double maskPTS;
     {
         std::lock_guard<std::mutex> g(_visionLock);
         mask = _visionMask;
@@ -373,11 +443,13 @@
             CVPixelBufferRetain(mask);
         visionError = _visionError;
         foreground = _visionHasForeground;
+        maskRevision = _maskRevision;
+        maskPTS = _maskPTS;
     }
     uint32_t featureMode =
         analysis == 2 && !foreground && [preset[@"lossMode"] intValue] == 0 ? 1 : analysis;
-    if (featureMode == 1) {
-        // The image-only shader path does not sample the mask.
+    const bool uploadMask = featureMode != 1 && _uploadedMaskRevision != maskRevision;
+    if (!uploadMask) {
         if (mask)
             CVPixelBufferRelease(mask);
     } else if (mask) {
@@ -409,10 +481,12 @@
             length:0
                  w:aw
                  h:ah];
-    if (fresh) {
+    if (freshAnalysis) {
         id<MTLBlitCommandEncoder> b = [c blitCommandEncoder];
         [b copyFromTexture:_gray toTexture:_previous];
         [b endEncoding];
+    }
+    if (freshOutput) {
         for (int i = 0; i < 2; ++i) {
             MTLRenderPassDescriptor *r = [MTLRenderPassDescriptor renderPassDescriptor];
             r.colorAttachments[0].texture = _history[i];
@@ -422,7 +496,7 @@
             [[c renderCommandEncoderWithDescriptor:r] endEncoding];
         }
     }
-    uint32_t flowRadius = _level >= 3 ? 2 : 4;
+    uint32_t flowRadius = profile.flowRadius;
     [self dispatch:@"flow"
            command:c
           textures:@[ _gray, _previous, _flow ]
@@ -440,14 +514,27 @@
             length:sizeof(opts)
                  w:aw
                  h:ah];
-    [c commit];
-    [c waitUntilCompleted];
-    const uint64_t analysisEnd = KRClockNS();
-    if (c.error) {
-        if (error)
-            *error = c.error;
-        return nil;
+    if (gpuClassify) {
+        struct RidgeOptions {
+            uint32_t width, height;
+            float threshold, sum, regions[5];
+        } options{uint32_t(aw), uint32_t(ah), [preset[@"threshold"] floatValue], 0, {}};
+        static_assert(sizeof(RidgeOptions) == 36);
+        for (int i = 0; i < 5; ++i) {
+            options.regions[i] = [preset[@"regions"][i] floatValue];
+            options.sum += std::max(options.regions[i], 0.f);
+        }
+        options.sum = std::max(options.sum, .001f);
+        id<MTLComputeCommandEncoder> encoder = [c computeCommandEncoder];
+        [encoder setComputePipelineState:_compute[@"classifyRidges"]];
+        [encoder setBuffer:_features offset:0 atIndex:0];
+        [encoder setBuffer:_ridgeMask offset:0 atIndex:1];
+        [encoder setBytes:&options length:sizeof(options) atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(aw, ah, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [encoder endEncoding];
     }
+    [c commit];
+    // Overlap CPU preset decoding with GPU analysis. Stateful tracking remains ordered.
     kira::Parameters p;
     p.width = [preset[@"lineWidth"] floatValue];
     p.distortion = [preset[@"distortion"] floatValue];
@@ -465,7 +552,7 @@
     p.hueOffset = [preset[@"hueOffset"] floatValue];
     p.colorMode = [preset[@"colorMode"] intValue];
     p.lossMode = [preset[@"lossMode"] intValue];
-    p.maxStrokes = _offline ? 1200 : (_level >= 4 ? 220 : 550);
+    p.maxStrokes = profile.maxStrokes;
     for (int i = 0; i < 4; ++i)
         p.shapes[i] = [preset[@"shapes"][i] floatValue];
     for (int i = 0; i < 5; ++i)
@@ -478,8 +565,19 @@
         [[NSScanner scannerWithString:s] scanHexInt:&hex];
         p.palette.push_back({(hex >> 16) / 255.f, ((hex >> 8) & 255) / 255.f, (hex & 255) / 255.f});
     }
+    [c waitUntilCompleted];
+    const uint64_t analysisEnd = KRClockNS();
+    if (c.error) {
+        if (error)
+            *error = c.error;
+        [self reset];
+        return nil;
+    }
+    if (uploadMask)
+        _uploadedMaskRevision = maskRevision;
     const uint64_t contourStart = KRClockNS();
-    auto vertices = _contours.update((kira::Feature *)_features.contents, aw, ah, w, h, pts, p);
+    auto vertices = _contours.update((kira::Feature *)_features.contents, aw, ah, w, h, pts, p,
+                                    gpuClassify ? (const uint8_t *)_ridgeMask.contents : nullptr);
     const uint64_t contourEnd = KRClockNS();
     // Both command buffers finish synchronously before render returns. Reuse this
     // session-local upload buffer, growing geometrically only when needed.
@@ -564,12 +662,16 @@
              0};
     if (!finish.enabled)
         finish.decay = 0;
-    int selectedMode = finish.mode;
+    int selectedMode = std::clamp(int(finish.mode), 0, 2);
+    finish.mode = uint32_t(selectedMode);
     // Keep distinct, newly allocated IOSurfaces: XPC/OBS clients may retain the
     // previous frame after render returns. Publish all three only on GPU success.
     NSMutableDictionary<NSNumber *, IOSurface *> *nextOutputs = [NSMutableDictionary dictionary];
-    NSMutableArray<id<MTLTexture>> *targets = [NSMutableArray arrayWithCapacity:3];
+    const bool singleOutput = _offline || _singleOutput;
+    NSMutableArray<id<MTLTexture>> *targets = [NSMutableArray arrayWithCapacity:singleOutput ? 1 : 3];
     for (int mode = 0; mode < 3; ++mode) {
+        if (singleOutput && mode != selectedMode)
+            continue;
         IOSurface *output = KRMakeSurface(w, h);
         id<MTLTexture> target = output ? [_device newTextureWithDescriptor:inputDesc
                                                                  iosurface:(__bridge IOSurfaceRef)output
@@ -584,10 +686,13 @@
         nextOutputs[@(mode)] = output;
         [targets addObject:target];
     }
-    [self dispatch:@"finish"
+    NSArray *finishTextures = singleOutput
+        ? @[input, _layer, _small[2], _history[_historyIndex], _history[1 - _historyIndex], targets[0]]
+        : @[input, _layer, _small[2], _history[_historyIndex], _history[1 - _historyIndex],
+            targets[0], targets[1], targets[2]];
+    [self dispatch:(singleOutput ? @"finishSingle" : @"finish")
            command:draw
-          textures:@[input, _layer, _small[2], _history[_historyIndex],
-                     _history[1 - _historyIndex], targets[0], targets[1], targets[2]]
+          textures:finishTextures
             buffer:nil
              bytes:&finish
             length:sizeof(finish)
@@ -606,19 +711,18 @@
     _historyIndex = 1 - _historyIndex;
     std::swap(_gray, _previous);
     _lastPTS = pts;
-    ++_frame;
     double cost = (KRClockNS() - start) * 1e-6;
-    _costEMA = _costEMA > 0 ? _costEMA * .92 + cost * .08 : cost;
-    if (!_offline && [preset[@"autoAdapt"] boolValue]) {
-        if (_costEMA > 29 && _frame % 30 == 0) {
-            _level = std::min(5, _level + 1);
-            _healthy = 0;
-        } else if (_costEMA < 19 && ++_healthy > 240) {
-            _level = std::max(0, _level - 1);
-            _healthy = 0;
-        }
-    } else
-        _level = 0;
+    const double queueMS = std::max(0., [metadata[@"queueMS"] doubleValue]);
+    _adaptive.observe(cost, queueMS, adapt);
+    _renderTimes.push(cost);
+    if (_lastRenderNS && drawEnd > _lastRenderNS)
+        _outputIntervals.push((drawEnd - _lastRenderNS) * 1e-6);
+    _lastRenderNS = drawEnd;
+    const double outputFPS = _outputIntervals.mean() > 0 ? 1000. / _outputIntervals.mean() : 0;
+    const double analysisGPU = c.GPUEndTime > c.GPUStartTime && c.GPUStartTime > 0
+        ? (c.GPUEndTime - c.GPUStartTime) * 1000. : 0;
+    const double drawGPU = draw.GPUEndTime > draw.GPUStartTime && draw.GPUStartTime > 0
+        ? (draw.GPUEndTime - draw.GPUStartTime) * 1000. : 0;
     _statistics = @{
         @"processingMS" : @(cost),
         // Wall-clock phases include encoding, scheduling and GPU waits, not GPU-only timestamps.
@@ -628,8 +732,22 @@
         @"strokes" : @(_contours.statistics.strokes),
         @"vertices" : @(_contours.statistics.vertices),
         @"candidates" : @(_contours.statistics.candidates),
-        @"adaptationLevel" : @(_level),
+        @"adaptationLevel" : @(usedLevel),
+        @"nextAdaptationLevel" : @(_adaptive.level()),
         @"analysisWidth" : @(aw),
+        @"analysisHeight" : @(ah),
+        @"gpuClassification" : @(gpuClassify),
+        @"outputSurfaceCount" : @(nextOutputs.count),
+        @"outputFPS" : @(outputFPS),
+        @"processingP95MS" : @(_renderTimes.p95()),
+        @"analysisGPUMS" : @(analysisGPU),
+        @"drawGPUMS" : @(drawGPU),
+        @"visionInferenceMS" : @(_visionMS.load()),
+        @"visionIntervalMS" : @(visionInterval * 1000),
+        @"visionMaskAgeMS" : @(foreground ? std::max(0., (pts - maskPTS) * 1000) : -1.),
+        @"visionBusy" : @(_visionBusy.load()),
+        @"queueMS" : @(queueMS),
+        @"vertexBufferBytes" : @(_vertexBuffer.length),
         @"visionReady" : @(foreground),
         @"visionError" : visionError ?: @"",
         @"audio" : @[

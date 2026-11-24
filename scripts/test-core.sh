@@ -20,3 +20,6 @@ if [[ $# -gt 0 ]]; then
     diff -u "$tmp/previous.digest" "$tmp/current.digest"
     echo "Geometry and statistics digests match the baseline." >&2
 fi
+
+"$compiler" -std=c++20 -O2 -Icore core/Contours.cpp tests/performance_test.cpp -o "$tmp/performance"
+"$tmp/performance"

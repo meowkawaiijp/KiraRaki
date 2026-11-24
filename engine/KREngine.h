@@ -4,6 +4,8 @@ NS_ASSUME_NONNULL_BEGIN
 @interface KREngine : NSObject
 @property(nonatomic, readonly) NSDictionary *statistics;
 @property(nonatomic) BOOL offline;
+@property(nonatomic) BOOL singleOutput;
+@property(nonatomic) BOOL gpuClassificationEnabled;
 - (nullable instancetype)initWithShader:(NSString *)path error:(NSError **)error;
 - (nullable IOSurface *)render:(IOSurface *)surface
                       metadata:(NSDictionary *)metadata
