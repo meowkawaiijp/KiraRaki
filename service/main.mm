@@ -5,6 +5,7 @@
 #include <atomic>
 #include <algorithm>
 #include <mutex>
+#include "Performance.hpp"
 
 @interface KRSession : NSObject
 @property KREngine *engine;
@@ -34,6 +35,8 @@
     NSDictionary *_preset;
     uint64_t _revision;
     std::atomic<int> _pending;
+    std::atomic<uint64_t> _droppedRequests;
+    uint64_t _renderedRequests;
     NSString *_latestSource;
     NSMutableDictionary *_recordOptions;
     KRMovieWriter *_movie, *_clean;
@@ -171,6 +174,7 @@
         reply(nil, @{@"error" : @"不正なフレーム記述子"});
         return;
     }
+    const uint64_t admittedNS = KRClockNS();
     uint64_t ticket = 0;
     {
         std::lock_guard<std::mutex> guard(_requestLock);
@@ -182,9 +186,11 @@
         }
     }
     if (!ticket) {
+        ++_droppedRequests;
         reply(nil, @{@"dropped" : @YES});
         return;
     }
+    IOSurfaceIncrementUseCount((__bridge IOSurfaceRef)surface);
     void (^complete)(IOSurface *, NSDictionary *) = ^(IOSurface *out, NSDictionary *info) {
         {
             std::lock_guard<std::mutex> guard(self->_requestLock);
@@ -194,6 +200,9 @@
                 [self->_latestTickets removeObjectForKey:source];
             --self->_pending;
         }
+        if ([info[@"dropped"] boolValue])
+            ++self->_droppedRequests;
+        IOSurfaceDecrementUseCount((__bridge IOSurfaceRef)surface);
         reply(out, info);
     };
     dispatch_async(_queue, ^{
@@ -238,9 +247,12 @@
                          cached);
                 return;
             }
+            NSMutableDictionary *renderMetadata = [metadata mutableCopy];
+            renderMetadata[@"queueMS"] = @((KRClockNS() - admittedNS) * 1e-6);
+            renderMetadata[@"queueDepth"] = @(self->_pending.load());
             IOSurface *out = [s.engine
                   render:surface
-                metadata:metadata
+                metadata:renderMetadata
                   preset:[self interpolated:[metadata[@"ptsNS"] doubleValue] * 1e-9 session:s]
                    error:&error];
             if (!out && !error)
@@ -250,14 +262,17 @@
                            userInfo:@{
                                NSLocalizedDescriptionKey : @"Metalフレームを生成できませんでした"
                            }];
-            NSMutableDictionary *m = [metadata mutableCopy];
+            NSMutableDictionary *m = renderMetadata;
             [m addEntriesFromDictionary:s.engine.statistics];
             m[@"renderedNS"] = @(KRClockNS());
-            m[@"latencyMS"] =
-                @((KRClockNS() - [metadata[@"ingestNS"] unsignedLongLongValue]) * 1e-6);
+            const uint64_t ingest = [metadata[@"ingestNS"] unsignedLongLongValue];
+            const uint64_t done = [m[@"renderedNS"] unsignedLongLongValue];
+            m[@"latencyMS"] = @(done >= ingest ? (done - ingest) * 1e-6 : 0.);
+            m[@"droppedRequests"] = @(self->_droppedRequests.load());
             if (error)
                 m[@"error"] = error.localizedDescription;
             if (out) {
+                ++self->_renderedRequests;
                 s.surface = out;
                 s.metadata = m;
                 s.revision = self->_revision;
@@ -387,6 +402,9 @@
             @"preset" : self->_preset,
             @"recording" : @(self->_recordOptions != nil),
             @"recordedFrames" : @(self->_movie.frames),
+            @"renderedRequests" : @(self->_renderedRequests),
+            @"droppedRequests" : @(self->_droppedRequests.load()),
+            @"pendingRequests" : @(self->_pending.load()),
             @"recordingBytes" : @([self recordingBytes]),
             @"recordingMBps" : @(self->_recordLatestPTS > self->_recordOrigin
                                      ? [self recordingBytes] * 1000.0 /

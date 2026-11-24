@@ -43,7 +43,9 @@ struct Statistics {
 };
 class Contours {
   public:
-    std::vector<Vertex> update(const Feature *, int, int, int, int, double, const Parameters &);
+    // GPU mask: 0/1 are decisions; >=2 requests CPU evaluation.
+    std::vector<Vertex> update(const Feature *, int, int, int, int, double, const Parameters &,
+                               const uint8_t *classified = nullptr);
     void reset();
     Statistics statistics;
 

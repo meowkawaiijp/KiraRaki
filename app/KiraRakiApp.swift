@@ -467,6 +467,15 @@ struct StudioView: View {
         statRow("描画ストローク", value: metric("strokes", format: "%.0f"))
         statRow("GPU頂点数", value: metric("vertices", format: "%.0f"))
         statRow("解析幅", value: metric("analysisWidth", format: "%.0f px"))
+        statRow("輪郭候補判定", value: model.metadata["gpuClassification"] as? Bool == true ? "Metal" : "CPU")
+        statRow("解析 / CPU輪郭", value: metric("analysisMS", format: "%.1f ms") + " / " + metric("contourMS", format: "%.1f ms"))
+        statRow("描画・合成", value: metric("drawMS", format: "%.1f ms"))
+        statRow("GPU解析 / 描画", value: metric("analysisGPUMS", format: "%.1f ms") + " / " + metric("drawGPUMS", format: "%.1f ms"))
+        statRow("処理時間 p95", value: metric("processingP95MS", format: "%.1f ms"))
+        statRow("待機時間", value: metric("queueMS", format: "%.1f ms"))
+        statRow("Vision推論 / 間隔", value: metric("visionInferenceMS", format: "%.0f ms") + " / " + metric("visionIntervalMS", format: "%.0f ms"))
+        statRow("入力コピー", value: metric("inputCopyBytes", format: "%.0f B"))
+        statRow("サービス破棄要求", value: String((model.serviceStatus["droppedRequests"] as? Int) ?? 0))
         statRow(
           "AIマスク", value: model.metadata["visionReady"] as? Bool == true ? "有効" : "取得中 / 画像処理")
         statRow("記録フレーム", value: String((model.serviceStatus["recordedFrames"] as? Int) ?? 0))
@@ -494,7 +503,7 @@ struct StudioView: View {
         Text("\(Int(progress*100))%")
         Button("中止") { model.cancelExport() }.buttonStyle(.plain)
       }
-      Text(metric("fps", format: "%.0f FPS"))
+      Text(metric("outputFPS", format: "%.0f render FPS"))
       Text(metric("processingMS", format: "GPU/CPU %.1f ms"))
       Text(metric("latencyMS", format: "推定 %.1f ms"))
       Text("OBS \(model.obsConnected ? "●" : "○")").foregroundStyle(

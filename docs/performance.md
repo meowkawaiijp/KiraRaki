@@ -26,3 +26,25 @@ bash scripts/test-core.sh 047f4b8903cc8d356909daa144b417db0e1fa57d
 - 1080p/30fps、実写、複数OBS入力でウォームアップ後の処理時間・フレーム欠落率・メモリを測定し、変更前と比較する。連続運転と外部基準の遅延も確認する。
 
 この文書は検証方法であり、実測済みの高速化率を主張するものではない。
+
+## 第2段階: GPU候補判定と適応制御
+
+- Metalで輪郭候補の画素判定を行い、判定境界に近い値はCPUの従来式へ戻す。CPUの曲線連結・追跡・変形は維持する。オフラインは従来のCPU判定。GPU判定の厳密な比較は実機受入項目。
+- GPU解析実行中にCPUの設定変換を進め、Vision入力の縮小をGPU解析コマンドに含める。Vision推論はGPU完了後に別キューで実行。フレームをまたぐ完全並列化ではなく、同一入力の追跡・残像・操作ログは順番通り処理する。
+- Visionマスクは新しい推論結果またはサイズ変更時のみ転送する。
+- 7段階の負荷制御は処理時間に加えサービス待機時間を評価する。連続8フレームの過負荷で段階を上げ、連続120フレームの余裕で復帰する。オフライン／自動調整OFFでは低品質化しない。解析サイズと発光サイズの変更で不要なフル解像度履歴を再確保しない。
+- IOSurface付きBGRAのCVPixelBufferはコピーせずXPCに渡し、応答までCVPixelBufferとIOSurfaceの使用カウントを保持。サービスも処理中に使用カウントを保持する。生BGRA・OBSは従来の3枠コピー経路を維持。Appleの[IOSurface共有注意事項](https://developer.apple.com/documentation/corevideo/cvpixelbuffercreatewithiosurface%28_%3A_%3A_%3A_%3A%29)を参照。
+- オフライン書き出しは選択した1出力のみ生成。ライブサービスはOBS／プレビュー／録画用の3出力を維持。
+- 詳細画面でCPU輪郭・GPUタイムスタンプ・p95・出力FPS・キュー待機・Vision間隔・入力コピー量・破棄要求を確認する。GPU時刻が利用できない場合は0。サービスの破棄要求は全入力の累計であり、カメラやOBS側のドロップを含まない。
+
+### Mac実機で比較
+
+```sh
+bash scripts/build.sh
+cli=build/KiraRaki.app/Contents/MacOS/KiraRakiCLI
+"$cli" demo --width 1920 --height 1080 --frames 120 --warmup 30 --fixed-quality --cpu-contours
+"$cli" demo --width 1920 --height 1080 --frames 120 --warmup 30 --fixed-quality
+"$cli" demo --width 1920 --height 1080 --frames 120 --warmup 30 --fixed-quality --single-output
+```
+
+同じコンピュータ・同じ設定・同じ熱条件で複数回実行し、平均とp95を比較する。人工映像のエンジン単体の計測であり、OBS往復やVision実写の実測ではない。Vision併用・カメラ入力・録画と切断再接続・全出力モード・透過コーデックの受入確認は別途実施する。

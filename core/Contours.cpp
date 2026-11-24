@@ -141,7 +141,7 @@ void Contours::reset() {
 }
 
 std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int oh, double pts,
-                                     const Parameters &p) {
+                                     const Parameters &p, const uint8_t *classified) {
     if (pts < lastPTS || pts - lastPTS > 2 || w != lastW || h != lastH)
         reset();
     float dt = lastPTS >= 0 ? std::clamp(float(pts - lastPTS), .001f, .2f) : 1 / 30.f;
@@ -175,6 +175,10 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
     for (int y = 1; y < h - 1; ++y)
         for (int x = 1; x < w - 1; ++x) {
             int i = y * w + x;
+            if (classified && classified[i] < 2) {
+                active[i] = classified[i];
+                continue;
+            }
             const auto &v = f[i];
             float corner = std::min(1.f, std::abs(v.gx * f[i + 1].gy - v.gy * f[i + 1].gx) * 4);
             float score =

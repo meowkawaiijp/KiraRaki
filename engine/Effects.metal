@@ -7,6 +7,10 @@ struct Feature {
 struct FeatureOptions {
     uint width, height, mode, pad;
 };
+struct RidgeOptions {
+    uint width, height;
+    float threshold, sum, regions[5];
+};
 struct FinishOptions {
     float glow, decay, enabled, pad;
     uint mode, width, height, pad2;
@@ -110,6 +114,29 @@ kernel void features(texture2d<float, access::read> gray [[texture(0)]],
                                        velocity.x,
                                        velocity.y};
 }
+// Parallel candidate extraction. Numerically marginal scores go back to the CPU.
+kernel void classifyRidges(const device Feature *f [[buffer(0)]],
+                           device uchar *active [[buffer(1)]],
+                           constant RidgeOptions &o [[buffer(2)]],
+                           uint2 p [[thread_position_in_grid]]) {
+    if (p.x >= o.width || p.y >= o.height) return;
+    uint i = p.y * o.width + p.x;
+    if (p.x == 0 || p.y == 0 || p.x + 1 == o.width || p.y + 1 == o.height) {
+        active[i] = 0;
+        return;
+    }
+    Feature v = f[i];
+    if (!(v.edge > o.threshold || v.outer > .18f)) {
+        active[i] = 0;
+        return;
+    }
+    float corner = min(1.f, abs(v.gx * f[i + 1].gy - v.gy * f[i + 1].gx) * 4);
+    float score = (o.regions[0] * v.outer + o.regions[1] * v.edge +
+                   o.regions[2] * v.texture * .45f + o.regions[3] * v.motion +
+                   o.regions[4] * corner) / o.sum;
+    float cutoff = o.threshold * .65f;
+    active[i] = abs(score - cutoff) <= .0001f ? 2 : (score > cutoff ? 1 : 0);
+}
 struct LineVertex {
     float x, y, r, g, b, a, side;
 };
@@ -194,4 +221,40 @@ kernel void finish(texture2d<float, access::read> input [[texture(0)]],
     composite.write(encodePremultiplied(c), p);
     black.write(encodePremultiplied(float4(l.rgb, 1)), p);
     transparent.write(encodePremultiplied(l), p);
+}
+
+// Offline or explicitly single-output clients avoid two unused full-size surfaces.
+kernel void finishSingle(texture2d<float, access::read> input [[texture(0)]],
+                         texture2d<float, access::read> line [[texture(1)]],
+                         texture2d<float, access::sample> bloom [[texture(2)]],
+                         texture2d<float, access::read> history [[texture(3)]],
+                         texture2d<float, access::write> nextHistory [[texture(4)]],
+                         texture2d<float, access::write> output [[texture(5)]],
+                         constant FinishOptions &o [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
+    if (p.x >= o.width || p.y >= o.height) return;
+    float2 uv = (float2(p) + .5) / float2(o.width, o.height);
+    float4 l = line.read(p) * o.enabled;
+    float4 b = 0;
+    if (o.glow != 0 && o.enabled != 0)
+        b = bloom.sample(smoothSampler, uv) * o.glow * o.enabled;
+    float peak = max(b.r, max(b.g, b.b));
+    float ba = clamp(max(b.a, peak), 0.f, .98f);
+    if (peak > ba)
+        b.rgb *= ba / max(peak, .0001f);
+    l.rgb += b.rgb * (1 - l.a);
+    l.a = clamp(l.a + ba * (1 - l.a), 0.f, 1.f);
+    float4 old = history.read(p) * o.decay;
+    l += old * (1 - l.a);
+    l.a = clamp(l.a, 0.f, 1.f);
+    nextHistory.write(l, p);
+    float4 c = l;
+    if (o.mode == 0) {
+        float4 bg = input.read(p);
+        float3 unpremul = bg.a > .0001 ? bg.rgb / bg.a : float3(0);
+        float3 linear =
+            float3(decode709(unpremul.r), decode709(unpremul.g), decode709(unpremul.b)) * bg.a;
+        c = float4(l.rgb + linear * (1 - l.a), l.a + bg.a * (1 - l.a));
+    } else if (o.mode == 1)
+        c.a = 1;
+    output.write(encodePremultiplied(c), p);
 }
