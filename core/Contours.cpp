@@ -82,9 +82,8 @@ static float noise(uint64_t seed, float position, double time) {
     auto value = [&](int64_t i, int64_t j) {
         return random01(seed ^ hash(uint64_t(i)) ^ hash(uint64_t(j) + 0xa24baed4963ee407ULL));
     };
-    const float v00 = value(x, y), v01 = value(x, y + 1);
-    float lo = v00 + (value(x + 1, y) - v00) * a;
-    float hi = v01 + (value(x + 1, y + 1) - v01) * a;
+    float lo = value(x, y) + (value(x + 1, y) - value(x, y)) * a;
+    float hi = value(x, y + 1) + (value(x + 1, y + 1) - value(x, y + 1)) * a;
     return lo + (hi - lo) * b;
 }
 static Color hsv(float h) {
