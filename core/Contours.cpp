@@ -166,7 +166,8 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
         float speed = std::hypot(v.flowX, v.flowY) / (analysisScale * dt);
         return std::clamp(std::max(v.motion * 1.8f, speed / 360.f), 0.f, 1.f);
     };
-    std::vector<uint8_t> active(w * h), visited(w * h);
+    active.assign(size_t(w) * h, 0);
+    visited.assign(size_t(w) * h, 0);
     float sum = 0;
     for (float a : p.regions)
         sum += std::max(a, 0.f);
@@ -210,6 +211,7 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
                         Point bestPoint;
                         float best = -100;
                         bool found = false;
+                        const bool guided = std::hypot(heading.x, heading.y) > .1f;
                         // Only bridge a missing pixel when adjacent ridge pixels run out.
                         for (int radius = 1; radius <= 2 && !found; ++radius)
                             for (int yy = -radius; yy <= radius; ++yy)
@@ -224,7 +226,6 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
                                         continue;
                                     Point step = direction(at, {float(nx), float(ny)});
                                     float alignment = heading.x * step.x + heading.y * step.y;
-                                    bool guided = std::hypot(heading.x, heading.y) > .1f;
                                     if (guided && alignment < (radius == 1 ? -.2f : .8f))
                                         continue;
                                     const auto &v = f[index];
@@ -286,6 +287,7 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
     constexpr float cell = 24;
     auto key = [](int x, int y) { return (uint64_t(uint32_t(x)) << 32) | uint32_t(y); };
     std::unordered_map<uint64_t, std::vector<size_t>> bins;
+    bins.reserve(tracks.size());
     for (size_t k = 0; k < tracks.size(); ++k) {
         auto &s = tracks[k];
         for (size_t i = 0; i < s.points.size(); ++i) {
@@ -332,6 +334,7 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
         if (match == SIZE_MAX) {
             if (tracks.size() < size_t(p.maxStrokes * 3)) {
                 Stroke s{nextID++, std::move(path), pts, pts, 1, c, {}, .5f};
+                s.motion.reserve(s.points.size());
                 for (auto q : s.points)
                     s.motion.push_back(activity(feature(q)));
                 tracks.push_back(std::move(s));
@@ -359,6 +362,7 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
         float priority, length;
     };
     std::vector<Ranked> ranked;
+    ranked.reserve(tracks.size());
     for (size_t index = 0; index < tracks.size(); ++index) {
         auto &s = tracks[index];
         Curve curve(s.points);
@@ -379,24 +383,29 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
     std::sort(ranked.begin(), ranked.end(), [](const Ranked &a, const Ranked &b) {
         return a.priority == b.priority ? a.index < b.index : a.priority < b.priority;
     });
-    std::unordered_map<uint64_t, float> selected;
+    // Track indices are stable after expiry and ranking, so a dense array replaces
+    // hashing each selected track ID. -1 preserves zero-length selection semantics.
+    std::vector<float> selected(tracks.size(), -1.f);
+    size_t selectedCount = 0;
     // Keep the last arc-length budget through a detection gap, so hold/fade modes still work.
     float remaining = lastCandidateLength * std::clamp(p.density, 0.f, 1.f);
     for (const auto &item : ranked) {
-        if (remaining < minimumLength || selected.size() >= size_t(p.maxStrokes))
+        if (remaining < minimumLength || selectedCount >= size_t(p.maxStrokes))
             break;
         float length = std::min(item.length, remaining);
-        selected[tracks[item.index].id] = length;
+        selected[item.index] = length;
+        ++selectedCount;
         remaining -= length;
     }
     std::vector<Vertex> vertices;
-    vertices.reserve(p.maxStrokes * 180);
-    for (auto &s : tracks) {
+    vertices.reserve(std::min<size_t>(400000, selectedCount * 180));
+    for (size_t index = 0; index < tracks.size(); ++index) {
         if (statistics.strokes >= p.maxStrokes || vertices.size() + 6 > 400000)
             break;
-        auto choice = selected.find(s.id);
-        if (choice == selected.end())
+        const float choice = selected[index];
+        if (choice < 0)
             continue;
+        auto &s = tracks[index];
         Color color = p.colorMode == 1 && !p.palette.empty()
                           ? p.palette[hash(s.id ^ p.seed) % p.palette.size()]
                           : hsv(p.hueOffset + random01(s.id ^ p.seed) +
@@ -411,7 +420,7 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
         if (alpha < .01f)
             continue;
         Curve curve(s.points);
-        float length = std::min(choice->second, curve.length());
+        float length = std::min(choice, curve.length());
         float start = (curve.length() - length) * random01(s.id ^ hash(p.seed));
         size_t count = std::clamp(size_t(std::ceil(length / (p.jaggedSpacing * analysisScale))) + 1,
                                   size_t(3), size_t(192));
@@ -447,6 +456,7 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
         }
         if (p.shapes[1] > .01f && q.size() > 3) {
             std::vector<Point> smoothPoints;
+            smoothPoints.reserve((q.size() - 1) * 3 + 1);
             float amount = p.shapes[1] / weights;
             for (size_t i = 0; i + 1 < q.size(); ++i) {
                 Point a = q[i ? i - 1 : i], b = q[i], c = q[i + 1],
@@ -467,7 +477,9 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
             q = std::move(smoothPoints);
         }
         size_t before = vertices.size();
-        std::vector<Point> run{q.front()};
+        std::vector<Point> run;
+        run.reserve(q.size() * (p.shapes[2] / weights > .01f ? 2 : 1));
+        run.push_back(q.front());
         float half = std::max(.4f, p.width * scale * .5f) + 1;
         for (size_t i = 1; i < q.size(); ++i) {
             float arc = start + length * (i - .5f) / (q.size() - 1);
@@ -477,7 +489,8 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
                                                    time * .15) < p.shapes[3] * .36f;
             if (gap) {
                 ribbon(run, color, alpha, half, vertices);
-                run = {q[i]};
+                run.clear();
+                run.push_back(q[i]);
                 continue;
             }
             float glitch = p.shapes[2] / weights;

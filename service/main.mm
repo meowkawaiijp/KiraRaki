@@ -166,31 +166,46 @@
         ![metadata[@"mode"] isKindOfClass:NSNumber.class] || [metadata[@"mode"] intValue] < 0 ||
         [metadata[@"mode"] intValue] > 2 || [metadata[@"protocol"] intValue] != 1 ||
         ![source isKindOfClass:NSString.class] || source.length > 256 || !surface.width ||
-        surface.width > 7680 || surface.height > 4320 ||
+        surface.width > 7680 || !surface.height || surface.height > 4320 ||
         surface.pixelFormat != kCVPixelFormatType_32BGRA) {
         reply(nil, @{@"error" : @"不正なフレーム記述子"});
         return;
     }
-    uint64_t ticket;
+    uint64_t ticket = 0;
     {
         std::lock_guard<std::mutex> guard(_requestLock);
-        ticket = ++_nextTicket;
-        _latestTickets[source] = @(ticket);
+        // A rejected request must not invalidate a previously admitted frame.
+        if (_pending.load() < 24) {
+            ++_pending;
+            ticket = ++_nextTicket;
+            _latestTickets[source] = @(ticket);
+        }
     }
-    if (_pending.fetch_add(1) >= 24) {
-        _pending--;
+    if (!ticket) {
         reply(nil, @{@"dropped" : @YES});
         return;
     }
+    void (^complete)(IOSurface *, NSDictionary *) = ^(IOSurface *out, NSDictionary *info) {
+        {
+            std::lock_guard<std::mutex> guard(self->_requestLock);
+            // Do not erase a newer request's ticket. Retire completed source IDs
+            // so arbitrary input IDs cannot grow the ticket map indefinitely.
+            if ([self->_latestTickets[source] unsignedLongLongValue] == ticket)
+                [self->_latestTickets removeObjectForKey:source];
+            --self->_pending;
+        }
+        reply(out, info);
+    };
     dispatch_async(_queue, ^{
         @autoreleasepool {
+            bool superseded;
             {
                 std::lock_guard<std::mutex> guard(self->_requestLock);
-                if ([self->_latestTickets[source] unsignedLongLongValue] != ticket) {
-                    self->_pending--;
-                    reply(nil, @{@"dropped" : @YES});
-                    return;
-                }
+                superseded = [self->_latestTickets[source] unsignedLongLongValue] != ticket;
+            }
+            if (superseded) {
+                complete(nil, @{@"dropped" : @YES});
+                return;
             }
             NSError *error = nil;
             KRSession *s = self->_sessions[source];
@@ -202,15 +217,13 @@
                             [self->_sessions removeObjectForKey:k];
                 }
                 if (self->_sessions.count >= 8) {
-                    self->_pending--;
-                    reply(nil, @{@"error" : @"入力数の上限です"});
+                    complete(nil, @{@"error" : @"入力数の上限です"});
                     return;
                 }
                 s = [KRSession new];
                 s.engine = [[KREngine alloc] initWithShader:self->_shader error:&error];
                 if (!s.engine) {
-                    self->_pending--;
-                    reply(nil, @{@"error" : error.localizedDescription ?: @"エンジン起動失敗"});
+                    complete(nil, @{@"error" : error.localizedDescription ?: @"エンジン起動失敗"});
                     return;
                 }
                 s.transitionFrom = self->_transitionFrom;
@@ -219,11 +232,10 @@
             s.lastActive = now;
             if (s.surface && s.revision == self->_revision &&
                 [s.metadata[@"ptsNS"] isEqual:metadata[@"ptsNS"]]) {
-                self->_pending--;
                 NSMutableDictionary *cached = [s.metadata mutableCopy];
                 cached[@"mode"] = metadata[@"mode"];
-                reply([s.engine latestSurfaceForMode:[metadata[@"mode"] integerValue]] ?: s.surface,
-                      cached);
+                complete([s.engine latestSurfaceForMode:[metadata[@"mode"] integerValue]] ?: s.surface,
+                         cached);
                 return;
             }
             IOSurface *out = [s.engine
@@ -257,8 +269,7 @@
                             clean:surface
                          metadata:metadata];
             }
-            self->_pending--;
-            reply(out, m);
+            complete(out, m);
         }
     });
 }
