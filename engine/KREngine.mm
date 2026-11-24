@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <mutex>
 #include <numeric>
 
@@ -17,7 +18,7 @@
     NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *_compute;
     id<MTLRenderPipelineState> _line;
     id<MTLTexture> _gray, _previous, _flow, _mask, _layer, _history[2], _small[3];
-    id<MTLBuffer> _features;
+    id<MTLBuffer> _features, _vertexBuffer;
     CIContext *_ci;
     dispatch_queue_t _visionQueue;
     std::mutex _visionLock;
@@ -33,6 +34,7 @@
     int _aw, _ah, _w, _h, _historyIndex, _frame, _level, _healthy, _bloomDivisor;
     double _lastPTS, _lastVision, _costEMA;
     std::vector<float> _audioWindow;
+    std::array<float, 2048> _hannWindow;
     std::vector<float> _prevSpectrum;
     std::array<float, 5> _audioFeatures;
     std::vector<float> _mappingState;
@@ -85,6 +87,7 @@
         _lastPTS = -1;
         _fft = vDSP_create_fftsetup(11, kFFTRadix2);
         _prevSpectrum.resize(1024);
+        vDSP_hann_window(_hannWindow.data(), _hannWindow.size(), vDSP_HANN_NORM);
     }
     return self;
 }
@@ -149,10 +152,11 @@
     size_t count = data.length / 4;
     for (size_t i = 0; i < count; ++i)
         _audioWindow.push_back(std::isfinite(s[i]) ? s[i] : 0);
-    while (_audioWindow.size() >= 2048) {
-        float window[2048], samples[2048], real[1024], imag[1024];
-        vDSP_hann_window(window, 2048, vDSP_HANN_NORM);
-        vDSP_vmul(_audioWindow.data(), 1, window, 1, samples, 1, 2048);
+    size_t consumed = 0;
+    while (_audioWindow.size() - consumed >= 2048) {
+        float samples[2048], real[1024], imag[1024];
+        const float *window = _audioWindow.data() + consumed;
+        vDSP_vmul(window, 1, _hannWindow.data(), 1, samples, 1, 2048);
         DSPSplitComplex split{real, imag};
         vDSP_ctoz((DSPComplex *)samples, 2, &split, 1, 1024);
         vDSP_fft_zrip(_fft, &split, 1, 11, FFT_FORWARD);
@@ -168,15 +172,15 @@
             _prevSpectrum[i] = mag;
         }
         for (int i = 0; i < 2048; ++i)
-            total += _audioWindow[i] * _audioWindow[i];
+            total += window[i] * window[i];
         _audioFeatures[0] = std::min(1.f, std::sqrt(total / 2048) * 4);
         for (int i = 0; i < 3; ++i)
             _audioFeatures[i + 1] = std::min(1.f, std::sqrt(bands[i]) * 5);
         _audioFeatures[4] = std::min(1.f, flux * 1.8f);
-        _audioWindow.erase(_audioWindow.begin(), _audioWindow.begin() + 512);
+        consumed += 512;
     }
-    if (_audioWindow.size() > 8192)
-        _audioWindow.erase(_audioWindow.begin(), _audioWindow.end() - 2048);
+    if (consumed)
+        _audioWindow.erase(_audioWindow.begin(), _audioWindow.begin() + consumed);
 }
 - (NSDictionary *)modulated:(NSDictionary *)preset dt:(float)dt {
     NSMutableDictionary *p = [preset mutableCopy];
@@ -210,9 +214,17 @@
     int vw = _level >= 2 ? 384 : 512,
         vh = std::max(1, int(surface.height * double(vw) / surface.width));
     CVPixelBufferRef pixel = nullptr;
-    CVPixelBufferCreate(
+    CVReturn status = CVPixelBufferCreate(
         kCFAllocatorDefault, vw, vh, kCVPixelFormatType_32BGRA,
         (__bridge CFDictionaryRef) @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}}, &pixel);
+    if (status != kCVReturnSuccess || !pixel) {
+        if (pixel)
+            CVPixelBufferRelease(pixel);
+        std::lock_guard<std::mutex> g(_visionLock);
+        _visionError = @"Vision入力バッファを確保できませんでした";
+        _visionBusy = false;
+        return;
+    }
     CGColorSpaceRef color = CGColorSpaceCreateWithName(kCGColorSpaceITUR_709);
     CIImage *image = [CIImage imageWithIOSurface:(__bridge IOSurfaceRef)surface
                                          options:@{kCIImageColorSpace : (__bridge id)color}];
@@ -331,6 +343,14 @@
                                          options:MTLResourceStorageModeShared];
         _contours.reset();
     }
+    if (!_gray || !_previous || !_flow || !_mask || !_layer || !_history[0] ||
+        !_history[1] || !_small[0] || !_small[1] || !_small[2] || !_features) {
+        [self reset];
+        if (error)
+            *error = [NSError errorWithDomain:@"KiraRaki" code:4
+                                     userInfo:@{NSLocalizedDescriptionKey : @"Metal作業領域を確保できませんでした"}];
+        return nil;
+    }
     MTLTextureDescriptor *inputDesc =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                            width:w
@@ -354,7 +374,13 @@
         visionError = _visionError;
         foreground = _visionHasForeground;
     }
-    if (mask) {
+    uint32_t featureMode =
+        analysis == 2 && !foreground && [preset[@"lossMode"] intValue] == 0 ? 1 : analysis;
+    if (featureMode == 1) {
+        // The image-only shader path does not sample the mask.
+        if (mask)
+            CVPixelBufferRelease(mask);
+    } else if (mask) {
         CIImage *im = [CIImage imageWithCVPixelBuffer:mask];
         im = [im imageByApplyingTransform:CGAffineTransformMakeScale(
                                               double(aw) / CVPixelBufferGetWidth(mask),
@@ -405,11 +431,7 @@
             length:sizeof(flowRadius)
                  w:(aw + 7) / 8
                  h:(ah + 7) / 8];
-    uint32_t opts[4] = {
-        (uint32_t)aw, (uint32_t)ah,
-        (uint32_t)(analysis == 2 && !foreground && [preset[@"lossMode"] intValue] == 0 ? 1
-                                                                                       : analysis),
-        0};
+    uint32_t opts[4] = {(uint32_t)aw, (uint32_t)ah, featureMode, 0};
     [self dispatch:@"features"
            command:c
           textures:@[ _gray, _previous, _mask, _flow ]
@@ -420,6 +442,7 @@
                  h:ah];
     [c commit];
     [c waitUntilCompleted];
+    const uint64_t analysisEnd = KRClockNS();
     if (c.error) {
         if (error)
             *error = c.error;
@@ -455,7 +478,28 @@
         [[NSScanner scannerWithString:s] scanHexInt:&hex];
         p.palette.push_back({(hex >> 16) / 255.f, ((hex >> 8) & 255) / 255.f, (hex & 255) / 255.f});
     }
+    const uint64_t contourStart = KRClockNS();
     auto vertices = _contours.update((kira::Feature *)_features.contents, aw, ah, w, h, pts, p);
+    const uint64_t contourEnd = KRClockNS();
+    // Both command buffers finish synchronously before render returns. Reuse this
+    // session-local upload buffer, growing geometrically only when needed.
+    const size_t vertexBytes = vertices.size() * sizeof(kira::Vertex);
+    if (vertexBytes) {
+        if (!_vertexBuffer || _vertexBuffer.length < vertexBytes) {
+            size_t capacity = std::max<size_t>(65536, _vertexBuffer.length);
+            while (capacity < vertexBytes)
+                capacity *= 2;
+            _vertexBuffer = [_device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+        }
+        if (!_vertexBuffer) {
+            [self reset];
+            if (error)
+                *error = [NSError errorWithDomain:@"KiraRaki" code:4
+                                         userInfo:@{NSLocalizedDescriptionKey : @"頂点バッファを確保できませんでした"}];
+            return nil;
+        }
+        std::memcpy(_vertexBuffer.contents, vertices.data(), vertexBytes);
+    }
     id<MTLCommandBuffer> draw = [_queue commandBuffer];
     MTLRenderPassDescriptor *r = [MTLRenderPassDescriptor renderPassDescriptor];
     r.colorAttachments[0].texture = _layer;
@@ -465,52 +509,53 @@
     id<MTLRenderCommandEncoder> e = [draw renderCommandEncoderWithDescriptor:r];
     [e setRenderPipelineState:_line];
     if (!vertices.empty()) {
-        id<MTLBuffer> vb = [_device newBufferWithBytes:vertices.data()
-                                                length:vertices.size() * sizeof(kira::Vertex)
-                                               options:MTLResourceStorageModeShared];
-        [e setVertexBuffer:vb offset:0 atIndex:0];
+        [e setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
         float size[2] = {(float)w, (float)h};
         [e setVertexBytes:size length:sizeof(size) atIndex:1];
         [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertices.size()];
     }
     [e endEncoding];
     int sw = std::max(1, w / _bloomDivisor), sh = std::max(1, h / _bloomDivisor);
-    [self dispatch:@"downsample"
-           command:draw
-          textures:@[ _layer, _small[0] ]
-            buffer:nil
-             bytes:nil
-            length:0
-                 w:sw
-                 h:sh];
-    float radius =
-        [preset[@"glowRadius"] floatValue] * (float(h) / 1080.f) / std::max(1, _bloomDivisor);
-    float dir[4] = {1.f / sw, 0, std::max(.5f, radius), 0};
-    [self dispatch:@"blur"
-           command:draw
-          textures:@[ _small[0], _small[1] ]
-            buffer:nil
-             bytes:dir
-            length:sizeof(dir)
-                 w:sw
-                 h:sh];
-    dir[0] = 0;
-    dir[1] = 1.f / sh;
-    [self dispatch:@"blur"
-           command:draw
-          textures:@[ _small[1], _small[2] ]
-            buffer:nil
-             bytes:dir
-            length:sizeof(dir)
-                 w:sw
-                 h:sh];
+    const float glow = [preset[@"glow"] floatValue];
+    const BOOL enabled = [preset[@"enabled"] boolValue];
+    if (glow != 0 && enabled) {
+        [self dispatch:@"downsample"
+               command:draw
+              textures:@[ _layer, _small[0] ]
+                buffer:nil
+                 bytes:nil
+                length:0
+                     w:sw
+                     h:sh];
+        float radius =
+            [preset[@"glowRadius"] floatValue] * (float(h) / 1080.f) / std::max(1, _bloomDivisor);
+        float dir[4] = {1.f / sw, 0, std::max(.5f, radius), 0};
+        [self dispatch:@"blur"
+               command:draw
+              textures:@[ _small[0], _small[1] ]
+                buffer:nil
+                 bytes:dir
+                length:sizeof(dir)
+                     w:sw
+                     h:sh];
+        dir[0] = 0;
+        dir[1] = 1.f / sh;
+        [self dispatch:@"blur"
+               command:draw
+              textures:@[ _small[1], _small[2] ]
+                buffer:nil
+                 bytes:dir
+                length:sizeof(dir)
+                     w:sw
+                     h:sh];
+    }
     float half = [preset[@"trailHalfLife"] floatValue];
     struct {
         float glow, decay, enabled, pad;
         uint32_t mode, w, h, pad2;
-    } finish{[preset[@"glow"] floatValue],
+    } finish{glow,
              half > 0 ? std::exp2(-dt / half) : 0.f,
-             [preset[@"enabled"] boolValue] ? 1.f : 0.f,
+             enabled ? 1.f : 0.f,
              0,
              (uint32_t)(metadata[@"mode"] ? [metadata[@"mode"] intValue]
                                           : [preset[@"outputMode"] intValue]),
@@ -520,32 +565,44 @@
     if (!finish.enabled)
         finish.decay = 0;
     int selectedMode = finish.mode;
+    // Keep distinct, newly allocated IOSurfaces: XPC/OBS clients may retain the
+    // previous frame after render returns. Publish all three only on GPU success.
+    NSMutableDictionary<NSNumber *, IOSurface *> *nextOutputs = [NSMutableDictionary dictionary];
+    NSMutableArray<id<MTLTexture>> *targets = [NSMutableArray arrayWithCapacity:3];
     for (int mode = 0; mode < 3; ++mode) {
-        IOSurface *surface = KRMakeSurface(w, h);
-        _outputs[@(mode)] = surface;
-        id<MTLTexture> target = [_device newTextureWithDescriptor:inputDesc
-                                                        iosurface:(__bridge IOSurfaceRef)surface
-                                                            plane:0];
-        finish.mode = mode;
-        [self dispatch:@"finish"
-               command:draw
-              textures:@[
-                  input, _layer, _small[2], _history[_historyIndex], _history[1 - _historyIndex],
-                  target
-              ]
-                buffer:nil
-                 bytes:&finish
-                length:sizeof(finish)
-                     w:w
-                     h:h];
+        IOSurface *output = KRMakeSurface(w, h);
+        id<MTLTexture> target = output ? [_device newTextureWithDescriptor:inputDesc
+                                                                 iosurface:(__bridge IOSurfaceRef)output
+                                                                     plane:0] : nil;
+        if (!target) {
+            [self reset];
+            if (error)
+                *error = [NSError errorWithDomain:@"KiraRaki" code:4
+                                         userInfo:@{NSLocalizedDescriptionKey : @"出力IOSurfaceを確保できませんでした"}];
+            return nil;
+        }
+        nextOutputs[@(mode)] = output;
+        [targets addObject:target];
     }
+    [self dispatch:@"finish"
+           command:draw
+          textures:@[input, _layer, _small[2], _history[_historyIndex],
+                     _history[1 - _historyIndex], targets[0], targets[1], targets[2]]
+            buffer:nil
+             bytes:&finish
+            length:sizeof(finish)
+                 w:w
+                 h:h];
     [draw commit];
     [draw waitUntilCompleted];
     if (draw.error) {
         if (error)
             *error = draw.error;
+        [self reset];
         return nil;
     }
+    _outputs = nextOutputs;
+    const uint64_t drawEnd = KRClockNS();
     _historyIndex = 1 - _historyIndex;
     std::swap(_gray, _previous);
     _lastPTS = pts;
@@ -564,6 +621,10 @@
         _level = 0;
     _statistics = @{
         @"processingMS" : @(cost),
+        // Wall-clock phases include encoding, scheduling and GPU waits, not GPU-only timestamps.
+        @"analysisMS" : @((analysisEnd - start) * 1e-6),
+        @"contourMS" : @((contourEnd - contourStart) * 1e-6),
+        @"drawMS" : @((drawEnd - contourEnd) * 1e-6),
         @"strokes" : @(_contours.statistics.strokes),
         @"vertices" : @(_contours.statistics.vertices),
         @"candidates" : @(_contours.statistics.candidates),

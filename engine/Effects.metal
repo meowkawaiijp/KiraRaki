@@ -35,6 +35,11 @@ kernel void flow(texture2d<float, access::read> now [[texture(0)]],
     if (p.x >= output.get_width() || p.y >= output.get_height())
         return;
     int2 center = int2(p) * 8 + 4;
+    // The current frame's 3x3 patch is identical for every candidate displacement.
+    float reference[9];
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++)
+            reference[(j + 1) * 3 + i + 1] = at(now, center + int2(i, j) * 2);
     float best = 1e9;
     int2 delta = 0;
     for (int y = -int(radius); y <= int(radius); y++)
@@ -43,7 +48,7 @@ kernel void flow(texture2d<float, access::read> now [[texture(0)]],
             for (int j = -1; j <= 1; j++)
                 for (int i = -1; i <= 1; i++) {
                     int2 q = center + int2(i, j) * 2;
-                    cost += abs(at(now, q) - at(previous, q - int2(x, y)));
+                    cost += abs(reference[(j + 1) * 3 + i + 1] - at(previous, q - int2(x, y)));
                 }
             cost += .003 * (abs(x) + abs(y));
             if (cost < best) {
@@ -71,12 +76,18 @@ kernel void features(texture2d<float, access::read> gray [[texture(0)]],
     int2 axis = abs(d.x) > abs(d.y) ? int2(1, 0) : int2(0, 1);
     float n1 = length(gradient(gray, q + axis)) * 2, n2 = length(gradient(gray, q - axis)) * 2;
     float ridge = mag >= n1 && mag >= n2 ? mag : 0;
-    float2 uv = (float2(p) + .5) / float2(o.width, o.height), du = 1.0 / float2(o.width, o.height);
-    float m = mask.sample(smoothSampler, uv).r;
-    float boundary = abs(mask.sample(smoothSampler, uv + float2(du.x, 0)).r -
-                         mask.sample(smoothSampler, uv - float2(du.x, 0)).r) +
-                     abs(mask.sample(smoothSampler, uv + float2(0, du.y)).r -
-                         mask.sample(smoothSampler, uv - float2(0, du.y)).r);
+    float m = 0, boundary = 0;
+    // Image-only mode never consumes the Vision mask. Hybrid needs only its boundary.
+    if (o.mode != 1) {
+        float2 uv = (float2(p) + .5) / float2(o.width, o.height);
+        float2 du = 1.0 / float2(o.width, o.height);
+        if (o.mode == 2)
+            m = mask.sample(smoothSampler, uv).r;
+        boundary = abs(mask.sample(smoothSampler, uv + float2(du.x, 0)).r -
+                       mask.sample(smoothSampler, uv - float2(du.x, 0)).r) +
+                   abs(mask.sample(smoothSampler, uv + float2(0, du.y)).r -
+                       mask.sample(smoothSampler, uv - float2(0, du.y)).r);
+    }
     float tex = abs(at(gray, q) - (at(gray, q + int2(2, 0)) + at(gray, q - int2(2, 0)) +
                                    at(gray, q + int2(0, 2)) + at(gray, q - int2(0, 2))) *
                                       .25) *
@@ -85,9 +96,7 @@ kernel void features(texture2d<float, access::read> gray [[texture(0)]],
         flowMap.read(min(p / 8, uint2(flowMap.get_width() - 1, flowMap.get_height() - 1))).rg;
     float motion = clamp(abs(at(gray, q) - at(prev, q)) * 3 + length(velocity) * .07, 0.f, 1.f) *
                    min(1.f, mag * 3);
-    if (o.mode == 1) {
-        boundary = 0;
-    } else if (o.mode == 2) {
+    if (o.mode == 2) {
         ridge *= m;
         tex *= m;
         motion *= m;
@@ -144,18 +153,29 @@ kernel void blur(texture2d<float, access::sample> src [[texture(0)]],
     }
     dst.write(c / sum, p);
 }
+float4 encodePremultiplied(float4 c) {
+    float3 straight = c.a > .0001 ? c.rgb / c.a : float3(0);
+    float3 encoded = float3(encode709(straight.r), encode709(straight.g), encode709(straight.b));
+    return float4(clamp(encoded, 0.f, 1.f) * c.a, c.a);
+}
+// All three output modes share exactly the same linear-light layer and trail.
+// Compute them once, then write three distinct IOSurface-backed textures.
 kernel void finish(texture2d<float, access::read> input [[texture(0)]],
                    texture2d<float, access::read> line [[texture(1)]],
                    texture2d<float, access::sample> bloom [[texture(2)]],
                    texture2d<float, access::read> history [[texture(3)]],
                    texture2d<float, access::write> nextHistory [[texture(4)]],
-                   texture2d<float, access::write> output [[texture(5)]],
+                   texture2d<float, access::write> composite [[texture(5)]],
+                   texture2d<float, access::write> black [[texture(6)]],
+                   texture2d<float, access::write> transparent [[texture(7)]],
                    constant FinishOptions &o [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
     if (p.x >= o.width || p.y >= o.height)
         return;
     float2 uv = (float2(p) + .5) / float2(o.width, o.height);
     float4 l = line.read(p) * o.enabled;
-    float4 b = bloom.sample(smoothSampler, uv) * o.glow * o.enabled;
+    float4 b = 0;
+    if (o.glow != 0 && o.enabled != 0)
+        b = bloom.sample(smoothSampler, uv) * o.glow * o.enabled;
     float peak = max(b.r, max(b.g, b.b));
     float ba = clamp(max(b.a, peak), 0.f, .98f);
     if (peak > ba)
@@ -166,16 +186,12 @@ kernel void finish(texture2d<float, access::read> input [[texture(0)]],
     l += old * (1 - l.a);
     l.a = clamp(l.a, 0.f, 1.f);
     nextHistory.write(l, p);
-    float4 c = l;
-    if (o.mode == 0) {
-        float4 bg = input.read(p);
-        float3 unpremul = bg.a > .0001 ? bg.rgb / bg.a : float3(0);
-        float3 linear =
-            float3(decode709(unpremul.r), decode709(unpremul.g), decode709(unpremul.b)) * bg.a;
-        c = float4(l.rgb + linear * (1 - l.a), l.a + bg.a * (1 - l.a));
-    } else if (o.mode == 1)
-        c.a = 1;
-    float3 straight = c.a > .0001 ? c.rgb / c.a : float3(0);
-    float3 encoded = float3(encode709(straight.r), encode709(straight.g), encode709(straight.b));
-    output.write(float4(clamp(encoded, 0.f, 1.f) * c.a, c.a), p);
+    float4 bg = input.read(p);
+    float3 unpremul = bg.a > .0001 ? bg.rgb / bg.a : float3(0);
+    float3 linear =
+        float3(decode709(unpremul.r), decode709(unpremul.g), decode709(unpremul.b)) * bg.a;
+    float4 c = float4(l.rgb + linear * (1 - l.a), l.a + bg.a * (1 - l.a));
+    composite.write(encodePremultiplied(c), p);
+    black.write(encodePremultiplied(float4(l.rgb, 1)), p);
+    transparent.write(encodePremultiplied(l), p);
 }

@@ -49,6 +49,8 @@ class Contours {
 
   private:
     std::vector<Stroke> tracks;
+    // Reuse the frame-sized tracing masks; assign() still clears them every frame.
+    std::vector<uint8_t> active, visited;
     uint64_t nextID = 1;
     double lastPTS = -1;
     float lastCandidateLength = 0;
