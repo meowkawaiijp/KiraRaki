@@ -1,0 +1,22 @@
+name: Contour regression
+on:
+  pull_request:
+    paths:
+      - 'core/**'
+      - 'tests/**'
+      - 'scripts/test-core.sh'
+      - '.github/workflows/contour-regression.yml'
+permissions:
+  contents: read
+jobs:
+  portable-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Test deterministic contour geometry against base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/test-core.sh "$BASE_SHA"
