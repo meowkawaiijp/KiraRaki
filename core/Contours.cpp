@@ -61,16 +61,8 @@ struct Curve {
     std::vector<Point> sample(float start, float end, size_t count) const {
         std::vector<Point> result;
         result.reserve(count);
-        // All callers sample an increasing arc interval. Start with one binary search,
-        // then advance a cursor instead of searching the full arc for every point.
-        size_t index = location(start).first;
-        for (size_t i = 0; i < count; ++i) {
-            float s = std::clamp(start + (end - start) * i / (count - 1), 0.f, length());
-            while (index + 1 < arc.size() && arc[index] <= s)
-                ++index;
-            float t = (s - arc[index - 1]) / std::max(.001f, arc[index] - arc[index - 1]);
-            result.push_back(mix(points[index - 1], points[index], t));
-        }
+        for (size_t i = 0; i < count; ++i)
+            result.push_back(at(start + (end - start) * i / (count - 1)));
         return result;
     }
 };
@@ -296,19 +288,14 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
     auto key = [](int x, int y) { return (uint64_t(uint32_t(x)) << 32) | uint32_t(y); };
     std::unordered_map<uint64_t, std::vector<size_t>> bins;
     bins.reserve(tracks.size());
-    const float motionAttack = 1 - std::exp(-dt / .045f);
-    const float motionRelease = 1 - std::exp(-dt / .24f);
-    const float trackingBlend = 1 - std::exp(-dt * (8 + p.tracking * 65));
-    const float salienceBlend = 1 - std::exp(-dt / .2f);
     for (size_t k = 0; k < tracks.size(); ++k) {
         auto &s = tracks[k];
         for (size_t i = 0; i < s.points.size(); ++i) {
             auto v = feature(s.points[i]);
             s.points[i].x += v.flowX;
             s.points[i].y += v.flowY;
-            float target = activity(v);
-            s.motion[i] += (target - s.motion[i]) *
-                           (target > s.motion[i] ? motionAttack : motionRelease);
+            float target = activity(v), tau = target > s.motion[i] ? .045f : .24f;
+            s.motion[i] += (target - s.motion[i]) * (1 - std::exp(-dt / tau));
         }
         s.center = center(s.points);
         bins[key(int(s.center.x / cell), int(s.center.y / cell))].push_back(k);
@@ -325,10 +312,7 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
                 if (bin == bins.end())
                     continue;
                 for (auto k : bin->second) {
-                    if (matched[k])
-                        continue;
-                    const float centerDistance = distance(c, tracks[k].center);
-                    if (centerDistance > 24)
+                    if (matched[k] || distance(c, tracks[k].center) > 24)
                         continue;
                     const auto &old = tracks[k].points;
                     float same =
@@ -339,7 +323,7 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
                     float error = std::min(same, flipped);
                     for (float t : {.25f, .5f, .75f})
                         error += distance(atFraction(path, flip ? 1 - t : t), atFraction(old, t));
-                    error = error / 5 + centerDistance * .2f;
+                    error = error / 5 + distance(c, tracks[k].center) * .2f;
                     if (error < best) {
                         best = error;
                         match = k;
@@ -363,8 +347,9 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
                 std::reverse(path.begin(), path.end());
             Curve curve(path);
             auto aligned = curve.sample(0, curve.length(), s.points.size());
+            float blend = 1 - std::exp(-dt * (8 + p.tracking * 65));
             for (size_t i = 0; i < s.points.size(); ++i)
-                s.points[i] = mix(s.points[i], aligned[i], trackingBlend);
+                s.points[i] = mix(s.points[i], aligned[i], blend);
             s.center = center(s.points);
             s.lastSeen = pts;
             s.confidence = 1;
@@ -378,27 +363,22 @@ std::vector<Vertex> Contours::update(const Feature *f, int w, int h, int ow, int
     };
     std::vector<Ranked> ranked;
     ranked.reserve(tracks.size());
-    const float placementTotal =
-        std::max(.001f, p.placement[0] + p.placement[1] + p.placement[2]);
     for (size_t index = 0; index < tracks.size(); ++index) {
         auto &s = tracks[index];
-        // Ranking needs only the total length, not a newly allocated arc table.
-        float length = 0;
-        for (size_t i = 1; i < s.points.size(); ++i)
-            length += distance(s.points[i - 1], s.points[i]);
-        float salience = 0;
+        Curve curve(s.points);
+        float salience = 0, total = p.placement[0] + p.placement[1] + p.placement[2];
         for (auto q : s.points) {
             const auto &v = feature(q);
             salience += (p.placement[0] + p.placement[1] * std::min(1.f, v.edge + v.outer) +
                          p.placement[2] * std::min(1.f, v.motion * 2)) /
-                        placementTotal;
+                        std::max(.001f, total);
         }
         salience /= s.points.size();
-        s.salience += (salience - s.salience) * salienceBlend;
+        s.salience += (salience - s.salience) * (1 - std::exp(-dt / .2f));
         // Selection stays anchored to the track: shape updates do not reshuffle whole lines.
         float priority = (.15f + .85f * random01(s.id ^ p.seed)) / (.3f + s.salience * .7f);
-        priority *= std::sqrt(std::max(1.f, targetLength * .45f / std::max(.001f, length)));
-        ranked.push_back({index, priority, length});
+        priority *= std::sqrt(std::max(1.f, targetLength * .45f / std::max(.001f, curve.length())));
+        ranked.push_back({index, priority, curve.length()});
     }
     std::sort(ranked.begin(), ranked.end(), [](const Ranked &a, const Ranked &b) {
         return a.priority == b.priority ? a.index < b.index : a.priority < b.priority;
